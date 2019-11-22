@@ -94,14 +94,148 @@ from ansible.module_utils.aws.core import AnsibleAWSModule, is_boto3_error_code
 from ansible.module_utils._text import to_native
 
 
-class AwsOrganizations():
-    def __init__(self, module):
+class AwsOrganization():
+    organizational_unit_arn = None
+    organization_tree = None
+    organizational_unit = None
+
+    def __init__(self, module, ou):
         self.module = module
         try:
             self.client = self.module.client('organizations')
         except (BotoCoreError, ClientError) as e:
             self.module.fail_json_aws(e, msg="Failed to connect to AWS")
-        self.aws_org_root = self.get_root()
+        if ou[:23] == "arn:aws:organizations::":
+            self.organizational_unit_arn = ou
+            self.organizational_unit = self.get_ou_by_arn(self.organizational_unit_arn)
+        elif self.ou_is_valid(ou):
+            self.organization_tree = self.get_aws_organization_tree(ou)
+            self.organizational_unit = self.get_organizational_unit_from_tree(self.orgazniation_tree, ou)
+        else:
+            self.module.fail_json(msg="Invalid organizational unit name")
+
+    def get_organizational_unit_from_tree(self, tree, path):
+        path_branches = path.split("/")
+        if path_branches[0] != "":
+            for index, ou in enumerate(tree["OrganizationalUnits"]):
+                if ou.get("Name") == path_branches[0]:
+                    if len(path_branches[1:]) > 0:
+                        return self.get_organizational_unit_from_tree(ou, "/".join(path_branches[1:]))
+                    ou["Accounts"] = self.get_children(ou["Id"])
+                    ou["OrganizationalUnits"] = self.get_children(
+                        ou["Id"],
+                        child_type="ORGANIZATIONAL_UNIT")
+                    return ou
+            return None
+        else:
+            self.module.fail_json(msg="Invalid organizational unit path")
+
+    def get_ou_by_arn(self, arn):
+        ou_id = arn.split("/")[-1]
+        return self.get_ou_by_id(ou_id)
+
+    def get_ou_by_id(self, ou_id):
+        try:
+            ou = self.client.describe_organizational_unit(OrganizationalUnitId=ou_id)
+        except (BotoCoreError, ClientError) as e:
+            self.module.fail_json_aws(e, msg="Failed to describe organizational unit")
+        else:
+            if ou is None:
+                return None
+            else:
+                ou = ou['OrganizationalUnit']
+                ou["Accounts"] = self.get_children(ou["Id"])
+                ou["OrganizationalUnits"] = self.get_children(
+                    ou["Id"],
+                    child_type="ORGANIZATIONAL_UNIT")
+                return ou
+
+
+    def get_aws_organization_tree(self, branch_filter=""):
+        aws_organization_roots = self.client.list_roots()
+        if len(aws_organization_roots.get("Roots")) != 1:
+            self.module.fail_json_aws(msg="Multiple roots are not supported")
+        else:
+            aws_organization_tree = aws_organization_roots.get("Roots")[0]
+        aws_organization_tree["Accounts"] = self.get_children(aws_organization_tree["Id"])
+        aws_organization_tree["OrganizationalUnits"] = self.get_children(
+                aws_organization_tree["Id"],
+                child_type="ORGANIZATIONAL_UNIT")
+        branch_filters = branch_filter.split("/")
+        if branch_filters[0] != "":
+            for index, ou in enumerate(aws_organization_tree["OrganizationalUnits"]):
+                organizational_unit_details = self.get_organizational_unit(ou.get("Id"))
+                if organizational_unit_details is None:
+                    continue
+                if  organizational_unit_details.get("Name") == branch_filters[0]:
+                    aws_organization_tree["OrganizationalUnits"][index] = self.get_aws_organizational_unit_tree(ou["Id"], "/".join(branch_filters[1:]))
+                    break
+        return aws_organization_tree
+
+    def get_aws_organizational_unit_tree(self, aws_organizational_unit_id, branch_filter=""):
+        aws_organizational_unit = self.get_organizational_unit(aws_organizational_unit_id)
+        aws_organizational_unit["Accounts"] = self.get_children(aws_organizational_unit["Id"])
+        aws_organizational_unit["OrganizationalUnits"] = self.get_children(
+                aws_organizational_unit["Id"],
+                child_type="ORGANIZATIONAL_UNIT")
+        branch_filters = branch_filter.split("/")
+        if branch_filters[0] != "":
+            for index, ou in enumerate(aws_organizational_unit["OrganizationalUnits"]):
+                organizational_unit_details = self.get_organizational_unit(ou.get("Id"))
+                if  organizational_unit_details.get("Name") == branch_filters[0]:
+                    aws_organizational_unit["OrganizationalUnits"][index] = self.get_aws_organizational_unit_tree(ou["Id"], "/".join(branch_filters[1:]))
+                    break
+        return aws_organizational_unit
+
+    def get_organizational_unit(self, aws_organizational_unit_id):
+        if aws_organizational_unit_id[:3] != "ou-":
+            self.module.faild_json(msg="Invalid organizational unit id")
+        try:
+            ou = self.client.describe_organizational_unit(OrganizationalUnitId=aws_organizational_unit_id)
+        except (BotoCoreError, ClientError) as e:
+            self.module.fail_json_aws(msg="Failed to describe organizational unit")
+        else:
+            if ou is None:
+                return None
+            else:
+                return ou['OrganizationalUnit']
+
+    def get_children(self, parent_id, child_type="ACCOUNT"):
+        if child_type not in ["ACCOUNT", "ORGANIZATIONAL_UNIT"]:
+            self.module.fail_json(msg="Invalid child object type")
+        paginator = self.client.get_paginator("list_children")
+        children = []
+        for page in paginator.paginate(
+            ParentId=parent_id,
+            ChildType=child_type):
+            children += page["Children"]
+        return children
+
+    def get_ou(self):
+        return self.organizational_unit
+
+    def organizational_unit_has_children(self):
+        if len(self.organizational_unit["Accounts"]) > 0 or
+                len(self.organizational_unit["OrganizationalUnits"]) > 0:
+            return True
+        return False
+
+    def delete_ou(self):
+        if self.organizational_unit_has_children():
+            self.module.fail_json(msg="Cannot delete organizational unit before deleting all children objects")
+        try:
+            self.client.delete_organizational_unit(OrganizationalUnitId=self.organizational_unit["Id"])
+        except (BotoCoreError, ClientError) as e:
+            self.module.fail_json_aws(e, msg="Failed to delete organizational unit")
+        else:
+            return True
+
+    def create_ou(self, ou_name):
+        pass
+
+
+
+######################################################################################################################
 
     def get_children_ous(self, parent_id, recursive=False):
         paginator = self.client.get_paginator('list_organizational_units_for_parent')
@@ -220,13 +354,6 @@ class AwsOrganizations():
                 parent_id = parent_ou['Id']
         return self._create_ou(ou_path[-1], parent_id)
 
-    def delete_ou(self, ou_id):
-        try:
-            self.client.delete_organizational_unit(OrganizationalUnitId=ou_id)
-        except (BotoCoreError, ClientError) as e:
-            self.module.fail_json_aws(e, msg="Failed to delete organizational unit")
-        else:
-            return True
 
 
 def main():
@@ -240,8 +367,6 @@ def main():
         supports_check_mode=True
     )
 
-    client = AwsOrganizations(module)
-
     result = dict(
         name=module.params.get('name'),
         ou=dict(),
@@ -249,10 +374,13 @@ def main():
         state='absent',
     )
 
+
     ou_name = module.params.get('name')
     ou_state = module.params.get('state')
 
-    ou = client.get_ou(ou_name)
+    client = AwsOrganization(module, ou_name)
+
+    ou = client.get_ou()
     if ou is None:
         result['state'] = 'absent'
     else:
@@ -265,7 +393,7 @@ def main():
         else:
             result['changed'] = True
             if not module.check_mode:
-                if client.delete_ou(ou['Id']):
+                if client.delete_ou():
                     result['state'] = 'absent'
     elif ou_state == 'present':
         if ou is None:
